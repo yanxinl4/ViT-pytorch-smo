@@ -1,0 +1,1 @@
+python train.py --name cifar100-t-g-smo --dataset cifar100 --model_type ViT-T_16 --fp16 --smo --alpha 0.1 --beta 0.2 --lam 0 --gradient_accumulation_steps 2 --noise gaussian --noise_ratio 1.0 --std_or_epsilon 0.2

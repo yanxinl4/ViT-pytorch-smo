@@ -6,17 +6,22 @@ import argparse
 import os
 import random
 import numpy as np
+import wandb
 
 from datetime import timedelta
+
+import csv
+import timm
+import matplotlib.pyplot as plt
 
 import torch
 import torch.distributed as dist
 
 from tqdm import tqdm
+# from torch.linalg import vector_norm
 from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 from apex.parallel import DistributedDataParallel as DDP
-
 from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader
@@ -25,6 +30,28 @@ from utils.dist_util import get_world_size
 
 logger = logging.getLogger(__name__)
 
+
+VIT_MODELS = {
+    "ViT-T_16": "vit_tiny_patch16_224",
+    "ViT-T_32": "vit_tiny_patch32_224",
+    "ViT-S_16": "vit_small_patch16_224",
+    "ViT-S_32": "vit_small_patch32_224",
+    "ViT-B_16": "vit_base_patch16_224",
+    "ViT-B_32": "vit_base_patch32_224",
+    "ViT-L_16": "vit_large_patch16_224",
+    "ViT-L_32": "vit_large_patch32_224",
+    "ViT-H_14": "vit_huge_patch14_224",
+    "R50-ViT-B_16": "vit_base_resnet50_224_in21k",
+}
+
+def save_metrics_to_csv(output_dir, name, global_step, train_loss, train_acc, val_loss, val_acc):
+    csv_path = os.path.join(output_dir, f"{name}_metrics.csv")
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        if write_header:
+            writer.writerow(["Step", "Train Loss", "Train Accuracy", "Validation Loss", "Validation Accuracy"])
+        writer.writerow([global_step, train_loss, train_acc, val_loss, val_acc])
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -56,19 +83,32 @@ def save_model(args, model):
 
 
 def setup(args):
+    num_classes = 10 if args.dataset == "cifar10" else 100
     # Prepare model
     config = CONFIGS[args.model_type]
-
-    num_classes = 10 if args.dataset == "cifar10" else 100
-
-    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
-    model.load_from(np.load(args.pretrained_dir))
+    if args.model_type in ["ViT-T_16", "ViT-T_32", "ViT-S_16", "ViT-S_32"]:
+        model_name = VIT_MODELS[args.model_type]    
+        logger.info(f"Loading pretrained model {model_name} from timm...")
+    
+        timm_model = timm.create_model(
+            model_name,
+            pretrained=True,
+            num_classes=num_classes
+        )
+        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, smo=args.smo)
+        model.load_from_timm(timm_model)
+    else:
+        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, smo=args.smo)
+        model.load_from(np.load(args.pretrained_dir))
+        
     model.to(args.device)
     num_params = count_parameters(model)
-
+    
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
     logger.info("Total Parameter: \t%2.1fM" % num_params)
+    if args.smo:
+        logger.info(f"Training smo with alpha={args.alpha}, beta={args.beta}, lam={args.lam}")
     print(num_params)
     return args, model
 
@@ -106,7 +146,10 @@ def valid(args, model, writer, test_loader, global_step):
         batch = tuple(t.to(args.device) for t in batch)
         x, y = batch
         with torch.no_grad():
-            logits = model(x)[0]
+            if args.smo:
+                logits, _ = model.pre(x)
+            else:
+                logits, _ = model(x)
 
             eval_loss = loss_fct(logits, y)
             eval_losses.update(eval_loss.item())
@@ -135,7 +178,96 @@ def valid(args, model, writer, test_loader, global_step):
     logger.info("Valid Accuracy: %2.5f" % accuracy)
 
     writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
-    return accuracy
+    return accuracy, eval_losses.avg
+
+def vectorize(x, multichannel=False):
+    """Vectorize data in any shape.
+
+    Args:
+        x (torch.Tensor): input data
+        multichannel (bool, optional): whether to keep the multiple channels (in the second dimension). Defaults to False.
+
+    Returns:
+        torch.Tensor: data of shape (sample_size, dimension) or (sample_size, num_channel, dimension) if multichannel is True.
+    """
+    if len(x.shape) == 1:
+        return x.unsqueeze(1)
+    if len(x.shape) == 2:
+        return x
+    else:
+        if not multichannel: # one channel
+            return x.reshape(x.shape[0], -1)
+        else: # multi-channel
+            return x.reshape(x.shape[0], x.shape[1], -1)
+
+def loss_vi(x0, x, xp, coef, alpha=0.1, beta=0.1, lam=0):
+    """INSO Loss"""
+    # print(coef)
+    loss_fct = torch.nn.CrossEntropyLoss()
+    s1 = loss_fct(x, x0) / 2 + loss_fct(xp, x0) / 2
+    s2 = alpha * coef.pow(2) - beta * coef.pow(2).log()
+    r = vectorize(x).to(x.dtype)
+    rp = vectorize(xp).to(x.dtype)
+    s3 = (r - rp).pow(2).sum(dim=1).mean()
+    # s3 = (vector_norm(r - rp, 2, dim=1)).pow(2).mean()
+    # print(s1, s2, lam* s3)
+    return s1 + s2 + lam * s3
+
+def inject_noise(x, y, model, noise_type, noise_ratio, std_or_epsilon, device, visualize=False):
+    """
+    Applies noise to input tensor x based on the specified noise type.
+    If visualize=True, returns both original and noisy images.
+    """
+    original_x = x.clone()  # Store original image for visualization
+    
+    if noise_type == "gaussian":
+        noise = torch.randn_like(x) * std_or_epsilon  # Gaussian noise
+        batch_mask = torch.rand(x.shape[0], device=x.device) < noise_ratio
+        batch_mask = batch_mask.view(-1, 1, 1, 1) 
+        x = x + noise * batch_mask
+        x = x.clamp(0, 1)
+
+    elif noise_type == "fgsm":
+        batch_mask = torch.rand(x.shape[0], device=x.device) < noise_ratio
+        if batch_mask.sum() == 0:
+            return x
+        
+        x_selected = x[batch_mask].clone().requires_grad_(True)
+        logits, _ = model(x_selected)
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(logits, y[batch_mask])
+        model.zero_grad()
+        loss.backward()
+        grad = x_selected.grad.sign()
+        x[batch_mask] = (x[batch_mask] + std_or_epsilon * grad).clamp(0, 1)
+
+    if visualize:
+        return original_x, x  # Return both original and noisy images
+    return x
+
+def visualize_images(original, noisy, step, output_dir):
+    """
+    Visualizes and saves a comparison of original and noisy images.
+    """
+    num_images = min(5, original.shape[0])  # Select 5 images to visualize
+    fig, axes = plt.subplots(2, num_images, figsize=(15, 5))
+
+    for i in range(num_images):
+        # Convert tensors to numpy arrays
+        orig_img = original[i].permute(1, 2, 0).cpu().numpy()
+        noisy_img = noisy[i].permute(1, 2, 0).cpu().numpy()
+
+        axes[0, i].imshow(orig_img)
+        axes[0, i].axis("off")
+        axes[0, i].set_title("Original")
+
+        axes[1, i].imshow(noisy_img)
+        axes[1, i].axis("off")
+        axes[1, i].set_title("Noisy")
+
+    plt.suptitle(f"Step {step}: Noise Visualization")
+    plt.savefig(os.path.join(output_dir, f"noise_visualization_step_{step}.png"))
+    plt.show()
 
 
 def train(args, model):
@@ -143,6 +275,7 @@ def train(args, model):
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
+        wandb.init(project="vit-training", name=args.name, config=args)
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -182,6 +315,7 @@ def train(args, model):
     model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
     losses = AverageMeter()
+    train_acc_metric = AverageMeter()
     global_step, best_acc = 0, 0
     while True:
         model.train()
@@ -193,8 +327,33 @@ def train(args, model):
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
-            loss = model(x, y)
 
+            # Inject noise with visualization option enabled every N steps
+            if global_step % args.eval_every == 0:
+                original_x, x = inject_noise(x, y, model, args.noise, args.noise_ratio, args.std_or_epsilon, args.device, visualize=True)
+                output_dir = args.output_dir + '/'  + str(args.noise) + str(args.noise_ratio) + '_' + str(args.std_or_epsilon)
+                os.makedirs(output_dir, exist_ok=True)
+                visualize_images(original_x, x, global_step, output_dir)
+            else:
+                x = inject_noise(x, y, model, args.noise, args.noise_ratio, args.std_or_epsilon, args.device)
+
+            if args.smo:
+                # Forward pass (INSO with stochastic perturbation)
+                output1, _ = model(x)
+                output2, _ = model(x)
+    
+                # Compute INSO loss
+                loss = loss_vi(y, output1, output2, model.coef,
+                               args.alpha, args.beta, args.lam)
+                preds = torch.argmax((output1 + output2)/2, dim=-1)
+            else:
+                loss = model(x, y)
+                logits, _ = model(x)      # TODO
+                preds = torch.argmax(logits, dim=-1)
+
+            acc = (preds == y).float().mean()
+            train_acc_metric.update(acc.item(), x.size(0))
+            
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
             if args.fp16:
@@ -202,6 +361,7 @@ def train(args, model):
                     scaled_loss.backward()
             else:
                 loss.backward()
+
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 losses.update(loss.item()*args.gradient_accumulation_steps)
@@ -220,12 +380,31 @@ def train(args, model):
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+
+                    wandb.log({
+                            "train/loss": losses.val,
+                            "train/lr": scheduler.get_lr()[0],
+                            "train/accuracy": acc.item(),
+                        }, step=global_step)
+
+
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy = valid(args, model, writer, test_loader, global_step)
+                    accuracy, val_loss = valid(args, model, writer, test_loader, global_step)
+                    save_metrics_to_csv(args.output_dir, args.name, global_step, 
+                                      losses.avg, train_acc_metric.avg, val_loss, accuracy)
+                    
+                    wandb.log({
+                        "val/loss": val_loss,
+                        "val/accuracy": accuracy,
+                        "train/avg_accuracy": train_acc_metric.avg,
+                        "train/avg_loss": losses.avg
+                    }, step=global_step)
+    
                     if best_acc < accuracy:
                         save_model(args, model)
                         best_acc = accuracy
                     model.train()
+                    train_acc_metric.reset()
 
                 if global_step % t_total == 0:
                     break
@@ -235,19 +414,31 @@ def train(args, model):
 
     if args.local_rank in [-1, 0]:
         writer.close()
+        wandb.finish()
     logger.info("Best Accuracy: \t%f" % best_acc)
     logger.info("End Training!")
 
 
 def main():
     parser = argparse.ArgumentParser()
+    # Smoothing parameters
+    parser.add_argument("--smo", action='store_true',
+                        help="Whether to use smoothing procedure")
+    parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--lam", type=float, default=0)
+    # Noise parameters
+    parser.add_argument("--noise", choices=["none", "gaussian", "fgsm"], default="none")
+    parser.add_argument("--noise_ratio", type=float, default=0)
+    parser.add_argument("--std_or_epsilon", type=float, default=0)
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
     parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
-                                                 "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
+                                                 "ViT-L_32", "ViT-H_14", "R50-ViT-B_16",
+                                                 "ViT-T_16", "ViT-T_32", "ViT-S_16", "ViT-S_32"],
                         default="ViT-B_16",
                         help="Which variant to use.")
     parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",

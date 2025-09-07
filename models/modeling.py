@@ -169,25 +169,78 @@ class Embeddings(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, coef, smo):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
+        self.smo = smo
+        self.coef = coef
+        print(self.coef)
 
     def forward(self, x):
-        h = x
-        x = self.attention_norm(x)
-        x, weights = self.attn(x)
-        x = x + h
+        if self.smo:
+            h1 = x
+            disturb1 = torch.rand(x.shape, device=x.device, dtype=x.dtype)
+            x1 = self.attention_norm(x + self.coef * disturb1)
+            x1, weights1 = self.attn(x1)
+            x1 = x1 + h1
+            
+            h1 = x1
+            x1 = self.ffn_norm(x1)
+            x1 = self.ffn(x1)
+            x1 = x1 + h1
+    
+            h2 = x
+            disturb2 = torch.rand(x.shape, device=x.device, dtype=x.dtype)
+            x2 = self.attention_norm(x + self.coef * disturb2)
+            x2, weights2 = self.attn(x2)
+            x2 = x2 + h2
+        
+            h2 = x2
+            x2 = self.ffn_norm(x2)
+            x2 = self.ffn(x2)
+            x2 = x2 + h2
+    
+            # final output
+            out = (x1 + x2) / 2
+            return out, (weights1 + weights2) / 2 if weights1 else weights1
+        else:
+            h = x
+            x = self.attention_norm(x)
+            x, weights = self.attn(x)
+            x = x + h
+    
+            h = x
+            x = self.ffn_norm(x)
+            x = self.ffn(x)
+            x = x + h
+            return x, weights
 
-        h = x
-        x = self.ffn_norm(x)
-        x = self.ffn(x)
-        x = x + h
-        return x, weights
+    def load_from_timm(self, timm_block):
+        with torch.no_grad():
+            self.attn.query.weight.copy_(timm_block.attn.qkv.weight[:self.hidden_size, :])
+            self.attn.key.weight.copy_(timm_block.attn.qkv.weight[self.hidden_size:2*self.hidden_size, :])
+            self.attn.value.weight.copy_(timm_block.attn.qkv.weight[2*self.hidden_size:, :])
+    
+            self.attn.query.bias.copy_(timm_block.attn.qkv.bias[:self.hidden_size])
+            self.attn.key.bias.copy_(timm_block.attn.qkv.bias[self.hidden_size:2*self.hidden_size])
+            self.attn.value.bias.copy_(timm_block.attn.qkv.bias[2*self.hidden_size:])
+    
+            self.attn.out.weight.copy_(timm_block.attn.proj.weight)
+            self.attn.out.bias.copy_(timm_block.attn.proj.bias)
+    
+            self.ffn.fc1.weight.copy_(timm_block.mlp.fc1.weight)
+            self.ffn.fc1.bias.copy_(timm_block.mlp.fc1.bias)
+            self.ffn.fc2.weight.copy_(timm_block.mlp.fc2.weight)
+            self.ffn.fc2.bias.copy_(timm_block.mlp.fc2.bias)
+    
+            self.attention_norm.weight.copy_(timm_block.norm1.weight)
+            self.attention_norm.bias.copy_(timm_block.norm1.bias)
+            self.ffn_norm.weight.copy_(timm_block.norm2.weight)
+            self.ffn_norm.bias.copy_(timm_block.norm2.bias)
 
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
@@ -228,14 +281,20 @@ class Block(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, coef, smo):
         super(Encoder, self).__init__()
         self.vis = vis
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis)
-            self.layer.append(copy.deepcopy(layer))
+        for i in range(config.transformer["num_layers"]):
+            # layer = Block(config, vis, coef, smo)
+            # self.layer.append(copy.deepcopy(layer))
+            if i == 0:
+                layer = Block(config, vis, coef, smo=True)
+                self.layer.append(copy.deepcopy(layer))
+            else:
+                layer = Block(config, vis, coef, smo=False)
+                self.layer.append(copy.deepcopy(layer))
 
     def forward(self, hidden_states):
         attn_weights = []
@@ -248,10 +307,10 @@ class Encoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config, img_size, vis):
+    def __init__(self, config, img_size, vis, coef, smo):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config, vis)
+        self.encoder = Encoder(config, vis, coef, smo)
 
     def forward(self, input_ids):
         embedding_output = self.embeddings(input_ids)
@@ -260,13 +319,21 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, smo=False, coef_fixed=None):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.classifier = config.classifier
-
-        self.transformer = Transformer(config, img_size, vis)
+        if coef_fixed is not None:
+            print(coef_fixed)
+            coef = torch.tensor(coef_fixed, 
+                                dtype=torch.get_default_dtype())
+            self.register_buffer('coef', coef)
+        else:
+            param = nn.Parameter(torch.randn(1))
+            self.register_parameter('coef', param)
+        print('#'*10, self.coef)
+        self.transformer = Transformer(config, img_size, vis, self.coef, smo)
         self.head = Linear(config.hidden_size, num_classes)
 
     def forward(self, x, labels=None):
@@ -279,6 +346,45 @@ class VisionTransformer(nn.Module):
             return loss
         else:
             return logits, attn_weights
+
+    def pre(self, input, sample_size=50):
+        s = [sample_size] + [1]*len(input.shape[1:])
+        samples = input.repeat(s)
+        with torch.no_grad():
+            y_rep, attn_weights = self.forward(samples)
+        ex_dim = len(y_rep.shape)
+        y_rep = y_rep.unsqueeze(ex_dim)
+        y_rep = list(torch.split(y_rep, input.size(0)))
+        y_rep = torch.cat(y_rep, dim=ex_dim)
+        y = y_rep.mean(dim=len(y_rep.shape) - 1)
+        return y, attn_weights
+
+    
+    def load_from_timm(self, timm_model):
+        with torch.no_grad():
+            self.transformer.embeddings.patch_embeddings.weight.copy_(timm_model.patch_embed.proj.weight)
+            self.transformer.embeddings.patch_embeddings.bias.copy_(timm_model.patch_embed.proj.bias)
+    
+            if self.transformer.embeddings.position_embeddings.shape == timm_model.pos_embed.shape:
+                self.transformer.embeddings.position_embeddings.copy_(timm_model.pos_embed)
+            else:
+                print(f"Warning: Position embedding size mismatch! "
+                      f"({self.transformer.embeddings.position_embeddings.shape} vs {timm_model.pos_embed.shape})")
+    
+            self.transformer.embeddings.cls_token.copy_(timm_model.cls_token)
+    
+            for i, block in enumerate(self.transformer.encoder.layer):
+                block.load_from_timm(timm_model.blocks[i])
+    
+            self.transformer.encoder.encoder_norm.weight.copy_(timm_model.norm.weight)
+            self.transformer.encoder.encoder_norm.bias.copy_(timm_model.norm.bias)
+    
+            if self.zero_head:
+                nn.init.zeros_(self.head.weight)
+                nn.init.zeros_(self.head.bias)
+            else:
+                self.head.weight.copy_(timm_model.head.weight)
+                self.head.bias.copy_(timm_model.head.bias)
 
     def load_from(self, weights):
         with torch.no_grad():
@@ -335,7 +441,6 @@ class VisionTransformer(nn.Module):
                     for uname, unit in block.named_children():
                         unit.load_from(weights, n_block=bname, n_unit=uname)
 
-
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
     'ViT-B_32': configs.get_b32_config(),
@@ -344,4 +449,9 @@ CONFIGS = {
     'ViT-H_14': configs.get_h14_config(),
     'R50-ViT-B_16': configs.get_r50_b16_config(),
     'testing': configs.get_testing(),
+    # small models
+    "ViT-T_16": configs.get_t16_config(),
+    "ViT-T_32": configs.get_t32_config(),
+    "ViT-S_16": configs.get_s16_config(),
+    "ViT-S_32": configs.get_s32_config(),
 }
